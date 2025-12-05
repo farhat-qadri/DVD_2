@@ -1,5 +1,5 @@
 import dash
-from dash import dcc, html, Input, Output, callback
+from dash import dcc, html, Input, Output
 import dash_bootstrap_components as dbc
 import plotly.express as px
 import pandas as pd
@@ -8,85 +8,92 @@ import numpy as np
 # ----------------------------------------------------------------------------------
 # 1. DATA LOADING & PREPARATION
 # ----------------------------------------------------------------------------------
-# We load the data once when the server starts.
-# For V0, we focus on the main application data.
+print("Loading data... this might take a moment.")
+
 try:
-    # Loading only necessary columns for V0 to save memory
-    cols_to_use = [
+    # --- Load Current Application Data ---
+    app_cols = [
         'SK_ID_CURR', 'TARGET', 'NAME_CONTRACT_TYPE', 'CODE_GENDER',
-        'AMT_INCOME_TOTAL', 'AMT_CREDIT', 'NAME_EDUCATION_TYPE', 
-        'NAME_FAMILY_STATUS', 'NAME_HOUSING_TYPE', 'AGE_YEARS' # We will create AGE_YEARS
+        'AMT_INCOME_TOTAL', 'NAME_EDUCATION_TYPE', 'DAYS_BIRTH'
     ]
+    df_curr = pd.read_csv('application_data.csv', usecols=app_cols)
     
-    # Read CSV (Assuming file is in the same directory)
-    # Using 'low_memory=False' to silence mixed type warnings on large files
-    df = pd.read_csv('application_data.csv')
+    # Feature Engineering (Current)
+    df_curr['Risk_Label'] = df_curr['TARGET'].map({0: 'Safe (0)', 1: 'High Risk (1)'})
+    df_curr['AGE_YEARS'] = (df_curr['DAYS_BIRTH'] / -365).astype(int)
+
+    # --- Load Previous Application Data ---
+    # We only need ID and Status to calculate refusal history
+    prev_cols = ['SK_ID_CURR', 'NAME_CONTRACT_STATUS']
+    df_prev = pd.read_csv('previous_application.csv', usecols=prev_cols)
+
+    # --- AGGREGATION STEP ---
+    # We must compress the 'previous' many-to-one relationship into 1 row per client
     
-    # Data Cleaning for V0
-    # Create a readable Target label
-    df['Risk_Label'] = df['TARGET'].map({0: 'Safe (0)', 1: 'High Risk (1)'})
+    # 1. Create a binary flag for refused loans
+    df_prev['is_refused'] = (df_prev['NAME_CONTRACT_STATUS'] == 'Refused').astype(int)
     
-    # Convert DAYS_BIRTH to Years (It is negative in the raw file)
-    df['AGE_YEARS'] = (df['DAYS_BIRTH'] / -365).astype(int)
+    # 2. Group by Client ID
+    prev_agg = df_prev.groupby('SK_ID_CURR').agg(
+        prev_app_count=('NAME_CONTRACT_STATUS', 'count'),
+        prev_refused_count=('is_refused', 'sum')
+    ).reset_index()
+
+    # 3. Calculate Refusal Rate (Refusals / Total Apps)
+    prev_agg['prev_refusal_rate'] = prev_agg['prev_refused_count'] / prev_agg['prev_app_count']
+
+    # --- MERGE STEP ---
+    # Merge history into current application (Left Join)
+    # Clients with no history will get NaN, which we fill with 0
+    df = df_curr.merge(prev_agg, on='SK_ID_CURR', how='left')
+    
+    # Fill missing values for clients who have NO previous history
+    df['prev_app_count'] = df['prev_app_count'].fillna(0)
+    df['prev_refused_count'] = df['prev_refused_count'].fillna(0)
+    df['prev_refusal_rate'] = df['prev_refusal_rate'].fillna(0)
+
+    print("Data loaded and merged successfully.")
 
 except FileNotFoundError:
-    # Fallback data for demonstration if file is missing
-    print("WARNING: 'application_data.csv' not found. Using dummy data.")
+    print("WARNING: Files not found. Generating Dummy Data.")
+    # Dummy data generator for testing without files
     df = pd.DataFrame({
         'TARGET': np.random.choice([0, 1], 1000, p=[0.9, 0.1]),
         'NAME_CONTRACT_TYPE': np.random.choice(['Cash loans', 'Revolving loans'], 1000),
         'CODE_GENDER': np.random.choice(['M', 'F'], 1000),
         'AMT_INCOME_TOTAL': np.random.normal(150000, 50000, 1000),
         'NAME_EDUCATION_TYPE': np.random.choice(['Higher education', 'Secondary'], 1000),
-        'AGE_YEARS': np.random.randint(20, 70, 1000)
+        'AGE_YEARS': np.random.randint(20, 70, 1000),
+        'prev_app_count': np.random.randint(0, 10, 1000),
+        'prev_refused_count': np.random.randint(0, 5, 1000)
     })
     df['Risk_Label'] = df['TARGET'].map({0: 'Safe', 1: 'Risk'})
+    df['prev_refusal_rate'] = df['prev_refused_count'] / df['prev_app_count']
+    df['prev_refusal_rate'] = df['prev_refusal_rate'].fillna(0)
 
 # ----------------------------------------------------------------------------------
 # 2. INITIALIZE DASH APP
 # ----------------------------------------------------------------------------------
-# Using the FLATLY theme for a clean, corporate financial look
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
-server = app.server  # Expose server for deployment
+server = app.server
 
 # ----------------------------------------------------------------------------------
 # 3. LAYOUT DEFINITION
 # ----------------------------------------------------------------------------------
-# Sidebar styling
-SIDEBAR_STYLE = {
-    "position": "fixed",
-    "top": 0,
-    "left": 0,
-    "bottom": 0,
-    "width": "18rem",
-    "padding": "2rem 1rem",
-    "background-color": "#f8f9fa",
-}
-
-# Main content styling
-CONTENT_STYLE = {
-    "margin-left": "18rem",
-    "margin-right": "2rem",
-    "padding": "2rem 1rem",
-}
-
 sidebar = html.Div(
     [
         html.H3("Risk Analyst", className="display-6"),
         html.Hr(),
         html.P("Filter the Portfolio", className="lead"),
         
-        # Filter 1: Contract Type
         html.Label("Contract Type"),
         dcc.Dropdown(
             id='filter-contract',
             options=[{'label': i, 'value': i} for i in df['NAME_CONTRACT_TYPE'].unique()],
-            value=None,  # None means Select All
+            value=None,
             placeholder="All Types",
             className="mb-3"
         ),
-
-        # Filter 2: Gender
         html.Label("Gender"),
         dcc.Dropdown(
             id='filter-gender',
@@ -95,86 +102,87 @@ sidebar = html.Div(
             placeholder="All Genders",
             className="mb-3"
         ),
-        
         html.Hr(),
-        html.P("Project V0.1", className="text-muted small"),
+        html.P("Project V1.0", className="text-muted small"),
     ],
-    style=SIDEBAR_STYLE,
+    style={"position": "fixed", "top": 0, "left": 0, "bottom": 0, "width": "18rem", "padding": "2rem 1rem", "background-color": "#f8f9fa"},
+)
+
+# Tab 1: Original content (Demographics)
+tab1_content = dbc.Card(
+    dbc.CardBody([
+        dbc.Row([
+            dbc.Col(dbc.Card([dbc.CardHeader("Total Apps"), dbc.CardBody(html.H4(id='kpi-total'))], color="primary", inverse=True)),
+            dbc.Col(dbc.Card([dbc.CardHeader("Default Rate"), dbc.CardBody(html.H4(id='kpi-rate'))], color="danger", inverse=True)),
+        ], className="mb-4"),
+        
+        dbc.Row([
+            dbc.Col(dcc.Graph(id='graph-target-dist'), width=6),
+            dbc.Col(dcc.Graph(id='graph-education-risk'), width=6),
+        ]),
+         dbc.Row([
+            dbc.Col(dcc.Graph(id='graph-income-dist'), width=12),
+        ])
+    ]),
+    className="mt-3"
+)
+
+# Tab 2: New Content (History Analysis)
+tab2_content = dbc.Card(
+    dbc.CardBody([
+        html.H4("Impact of Credit History on Default Risk", className="mb-3"),
+        html.P("Does a history of rejection or frequent borrowing affect current repayment?", className="text-muted"),
+        
+        dbc.Row([
+            # Graph: Previous Rejection Rate vs Current Risk
+            dbc.Col(dcc.Graph(id='graph-refusal-impact'), width=6),
+            
+            # Graph: Number of Previous Loans vs Current Risk
+            dbc.Col(dcc.Graph(id='graph-count-impact'), width=6),
+        ]),
+        
+        dbc.Row([
+            dbc.Col(
+                dbc.Alert(
+                    "Insight: High refusal rates in the past often correlate with higher default risk now. "
+                    "However, customers with many successful past loans (high count, low refusal) are usually safer.",
+                    color="info", className="mt-4"
+                )
+            )
+        ])
+    ]),
+    className="mt-3"
 )
 
 content = html.Div(
     [
-        html.H2("Portfolio Overview Dashboard", className="mb-4"),
-        
-        # Row 1: KPI Cards
-        dbc.Row(
+        html.H2("Credit Risk Dashboard", className="mb-4"),
+        dbc.Tabs(
             [
-                dbc.Col(dbc.Card([
-                    dbc.CardHeader("Total Applications"),
-                    dbc.CardBody(html.H4(id='kpi-total-apps', className="card-title"))
-                ], color="primary", inverse=True), width=3),
-                
-                dbc.Col(dbc.Card([
-                    dbc.CardHeader("Default Rate (%)"),
-                    dbc.CardBody(html.H4(id='kpi-default-rate', className="card-title"))
-                ], color="danger", inverse=True), width=3),
-                
-                dbc.Col(dbc.Card([
-                    dbc.CardHeader("Avg Income (Safe)"),
-                    dbc.CardBody(html.H4(id='kpi-avg-income-safe', className="card-title"))
-                ], color="success", inverse=True), width=3),
-                 dbc.Col(dbc.Card([
-                    dbc.CardHeader("Avg Income (Risk)"),
-                    dbc.CardBody(html.H4(id='kpi-avg-income-risk', className="card-title"))
-                ], color="warning", inverse=True), width=3),
+                dbc.Tab(tab1_content, label="Current Profile Analysis", tab_id="tab-1"),
+                dbc.Tab(tab2_content, label="History & Behavior Analysis", tab_id="tab-2"),
             ],
-            className="mb-4"
+            id="tabs",
+            active_tab="tab-1",
         ),
-
-        # Row 2: Main Charts
-        dbc.Row(
-            [
-                # Chart 1: Target Variable Distribution
-                dbc.Col(
-                    dcc.Loading(children=[dcc.Graph(id='graph-target-dist')]), 
-                    width=6
-                ),
-                # Chart 2: Default Rate by Education
-                dbc.Col(
-                    dcc.Loading(children=[dcc.Graph(id='graph-education-risk')]), 
-                    width=6
-                ),
-            ],
-            className="mb-4"
-        ),
-
-        # Row 3: Continuous Variable Analysis
-        dbc.Row(
-            [
-                dbc.Col(
-                    dcc.Loading(children=[dcc.Graph(id='graph-income-dist')]),
-                    width=12
-                )
-            ]
-        )
     ],
-    style=CONTENT_STYLE,
+    style={"margin-left": "18rem", "margin-right": "2rem", "padding": "2rem 1rem"},
 )
 
 app.layout = html.Div([sidebar, content])
 
 # ----------------------------------------------------------------------------------
-# 4. CALLBACKS (LOGIC)
+# 4. CALLBACKS
 # ----------------------------------------------------------------------------------
 @app.callback(
     [
-        Output('kpi-total-apps', 'children'),
-        Output('kpi-default-rate', 'children'),
-        Output('kpi-avg-income-safe', 'children'),
-        Output('kpi-avg-income-risk', 'children'),
+        Output('kpi-total', 'children'),
+        Output('kpi-rate', 'children'),
         Output('graph-target-dist', 'figure'),
         Output('graph-education-risk', 'figure'),
-        Output('graph-income-dist', 'figure')
+        Output('graph-income-dist', 'figure'),
+        Output('graph-refusal-impact', 'figure'),
+        Output('graph-count-impact', 'figure')
     ],
     [
         Input('filter-contract', 'value'),
@@ -182,61 +190,63 @@ app.layout = html.Div([sidebar, content])
     ]
 )
 def update_dashboard(contract_filter, gender_filter):
-    # 1. Filter Data
+    # Filter Data
     dff = df.copy()
     if contract_filter:
         dff = dff[dff['NAME_CONTRACT_TYPE'] == contract_filter]
     if gender_filter:
         dff = dff[dff['CODE_GENDER'] == gender_filter]
 
-    # 2. Calculate KPIs
-    total_apps = len(dff)
-    default_rate = (dff['TARGET'].mean() * 100)
-    avg_income_safe = dff[dff['TARGET'] == 0]['AMT_INCOME_TOTAL'].mean()
-    avg_income_risk = dff[dff['TARGET'] == 1]['AMT_INCOME_TOTAL'].mean()
+    # KPIs
+    kpi_total = f"{len(dff):,.0f}"
+    kpi_rate = f"{(dff['TARGET'].mean() * 100):.2f}%"
 
-    # Format KPIs
-    kpi_total = f"{total_apps:,.0f}"
-    kpi_rate = f"{default_rate:.2f}%"
-    kpi_inc_safe = f"${avg_income_safe:,.0f}" if not pd.isna(avg_income_safe) else "N/A"
-    kpi_inc_risk = f"${avg_income_risk:,.0f}" if not pd.isna(avg_income_risk) else "N/A"
-
-    # 3. Create Visualizations
+    # --- TAB 1 CHARTS ---
+    # 1. Pie
+    fig_target = px.pie(dff, names='Risk_Label', title='Risk Distribution', color='Risk_Label',
+                        color_discrete_map={'Safe (0)': '#2ecc71', 'High Risk (1)': '#e74c3c'}, hole=0.4)
     
-    # Graph 1: Target Distribution (Donut Chart)
-    fig_target = px.pie(
-        dff, names='Risk_Label', title='Portfolio Risk Distribution',
-        color='Risk_Label',
-        color_discrete_map={'Safe (0)': '#2ecc71', 'High Risk (1)': '#e74c3c'},
-        hole=0.4
-    )
-
-    # Graph 2: Risk by Education (Bar Chart)
-    # We calculate the mean TARGET per education level
-    risk_by_edu = dff.groupby('NAME_EDUCATION_TYPE')['TARGET'].mean().reset_index()
-    risk_by_edu = risk_by_edu.sort_values('TARGET', ascending=False)
-    
-    fig_edu = px.bar(
-        risk_by_edu, x='TARGET', y='NAME_EDUCATION_TYPE', orientation='h',
-        title='Default Probability by Education Level',
-        labels={'TARGET': 'Default Rate', 'NAME_EDUCATION_TYPE': 'Education'},
-        color='TARGET', color_continuous_scale='Reds'
-    )
+    # 2. Education Bar
+    edu_risk = dff.groupby('NAME_EDUCATION_TYPE')['TARGET'].mean().reset_index().sort_values('TARGET')
+    fig_edu = px.bar(edu_risk, x='TARGET', y='NAME_EDUCATION_TYPE', orientation='h',
+                     title='Default Rate by Education', color='TARGET', color_continuous_scale='Reds')
     fig_edu.update_layout(xaxis_tickformat=".1%")
 
-    # Graph 3: Income Distribution Box Plot
-    # Limiting income to avoid outliers skewing the view (Visual aid only)
-    # Using 95th percentile for better scaling
+    # 3. Income Box (No outliers)
     cutoff = dff['AMT_INCOME_TOTAL'].quantile(0.95)
-    dff_viz = dff[dff['AMT_INCOME_TOTAL'] < cutoff]
-    
-    fig_inc = px.box(
-        dff_viz, x='AMT_INCOME_TOTAL', y='Risk_Label', color='Risk_Label',
-        title='Income Distribution: Safe vs Risk (Outliers Removed)',
-        color_discrete_map={'Safe (0)': '#2ecc71', 'High Risk (1)': '#e74c3c'}
-    )
+    fig_inc = px.box(dff[dff['AMT_INCOME_TOTAL'] < cutoff], x='AMT_INCOME_TOTAL', y='Risk_Label', 
+                     color='Risk_Label', title='Income vs Risk', 
+                     color_discrete_map={'Safe (0)': '#2ecc71', 'High Risk (1)': '#e74c3c'})
 
-    return kpi_total, kpi_rate, kpi_inc_safe, kpi_inc_risk, fig_target, fig_edu, fig_inc
+    # --- TAB 2 CHARTS (NEW) ---
+    
+    # 4. Impact of Previous Refusals
+    # Binning the refusal rate to make it readable (0%, 0-50%, 50-100%)
+    dff['Refusal_Bin'] = pd.cut(dff['prev_refusal_rate'], bins=[-0.1, 0, 0.5, 1.0], labels=['No Refusals', 'Some Refusals', 'Mostly Refused'])
+    refusal_risk = dff.groupby('Refusal_Bin', observed=False)['TARGET'].mean().reset_index()
+    
+    fig_refusal = px.bar(
+        refusal_risk, x='Refusal_Bin', y='TARGET', 
+        title='Does Past Rejection Predict Future Default?',
+        labels={'TARGET': 'Current Default Rate', 'Refusal_Bin': 'Past Refusal History'},
+        color='TARGET', color_continuous_scale='Reds'
+    )
+    fig_refusal.update_layout(yaxis_tickformat=".1%")
+
+    # 5. Impact of Previous Loan Count
+    # Binning count to handle outliers (0, 1-3, 4-7, 8+)
+    dff['Count_Bin'] = pd.cut(dff['prev_app_count'], bins=[-1, 0, 3, 7, 100], labels=['0', '1-3', '4-7', '8+'])
+    count_risk = dff.groupby('Count_Bin', observed=False)['TARGET'].mean().reset_index()
+    
+    fig_count = px.bar(
+        count_risk, x='Count_Bin', y='TARGET',
+        title='Does Loan Frequency Predict Default?',
+        labels={'TARGET': 'Current Default Rate', 'Count_Bin': 'Number of Previous Applications'},
+        color='TARGET', color_continuous_scale='Blues'
+    )
+    fig_count.update_layout(yaxis_tickformat=".1%")
+
+    return kpi_total, kpi_rate, fig_target, fig_edu, fig_inc, fig_refusal, fig_count
 
 # ----------------------------------------------------------------------------------
 # 5. RUN SERVER

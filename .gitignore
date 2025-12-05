@@ -1,0 +1,12 @@
+venv/
+data/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+.DS_Store
+.env
+application_data.csv
+previous_application.csv
+columns_description.xlsx
